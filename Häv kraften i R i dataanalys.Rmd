@@ -1,0 +1,883 @@
+---
+title: "Häv kraften i R i dataanalys"
+author: "Svetlana Serikova & Anders Elias"
+date: "2024-04-17"
+output: html_document
+---
+
+# Intro
+
+# Basic geospatial data processing with R
+## Vector
+## Raster
+## LiDAR point cloud
+
+# Break 5 minutes
+
+# Advanced geospatial data processing with R
+## Java skript karta
+## Google API + OSM API
+## 3D visualisation with Rayshader
+
+# Tillägg: tree segmentation R+FME
+
+# Feedback
+
+
+
+
+# Basic geospatial data processing with R
+## Vector
+### Tematiska kartor i R - visualisering av statistiska data
+### Datakälla: https://www.scb.se/hitta-statistik/regional-statistik-och-kartor/regionala-indelningar/regso---regionala-statistikomraden/regso-tabellerna-i-statistikdatabasen---information-och-instruktioner/
+
+### Tematiska kartor är ett kraftfullt verktyg för att visualisera statistiska data geografiskt, vilket möjliggör en snabb och
+### intuitiv förståelse av rumsliga mönster och samband. I R kan detta uppnås genom att kombinera rumsliga data
+### (som geografiska positioner och områdesgränser) med statistiska data (som befolkningsantal, ekonomiska indikatorer, hälsostatistik).
+
+### Skriptet använder paket som 'sf' för att hantera rumsliga data och 'tmap' för att skapa interaktiva kartor.
+### Processen involverar följande steg:
+### 1. Inläsning/förberedelse av de geografiska data: Dessa data definierar de områden som ska visualiseras och tillhandahåller ramverket för kartan.
+### 2. Inläsning/förberedelse av statistiska data: Dessa data representerar de variabler som ska visualiseras och analyseras geografiskt.
+### 3. Kombination av de geografiska och statistiska data för att skapa en sammanhängande datamängd som kan användas för kartläggning.
+### 4. Design och skapande av den tematiska kartan med hjälp av tm_shape, tm_fill, för att specificera hur olika datalager och estetiska attribut ska presenteras.
+
+### Genom att visualisera statistik på tematiska kartor kan komplexa data göras lättillgängliga och tolkningsbara,
+### vilket stödjer effektiv kommunikation och beslutsfattande.
+
+### Definiera en funktion för att kontrollera och installera paket.
+```{r,warning=FALSE,message=FALSE}
+install_if_missing <- function(packages) {
+  for (package in packages) {
+    if (!require(package,character.only=TRUE)) {
+      install.packages(package)
+      library(package, character.only=TRUE)
+    }
+  }
+}
+```
+
+### Ange paketen som krävs för skriptet.
+```{r,warning=FALSE,message=FALSE}
+required_packages=c("sf","dplyr","jsonlite","stringr","tmap","stringdist","supercells","terra","lidR","rayshader","raster","gstat","osmdata","areal","httr","magick")
+```
+
+### Kontrollera och installera saknade paket.
+```{r,warning=FALSE,message=FALSE}
+install_if_missing(required_packages)
+```
+
+### Ladda nödvändiga paket.
+```{r,warning=FALSE,message=FALSE}
+library(sf)
+library(dplyr)
+library(jsonlite)
+library(stringr)
+library(tmap)
+```
+
+### Läs in geometridata för registreringsområden (RegSO) från GeoPackage.
+```{r}
+(regso=st_read("Vector/RegSO_2018_v2.gpkg"))
+```
+
+### Filtrera ut data för Göteborgs kommun.
+```{r}
+(goteborg_regso=regso %>% filter(kommunnamn=="Göteborg"))
+```
+
+### Visa den geometriska plotten för Göteborgs kommun.
+```{r}
+plot(st_geometry(goteborg_regso))
+```
+
+### Läs in SCB-data från CSV-fil och filtrera bort totalvärden.
+```{r}
+(regso_data=read.csv("Vector/000005FF.csv",fileEncoding="ISO8859-1",sep=";") %>% filter(kön != "totalt"))
+```
+
+### Bearbeta data för att extrahera 'kommun' och 'regso' och justera textsträngar.
+```{r}
+regso_data=regso_data %>%
+  mutate(
+    kommun=str_trim(str_extract(region, "^[^(]+")),
+    regso=str_replace_all(str_extract(region, "\\((.*?)\\)"), "\\(|\\)", "")
+  ) %>% 
+  filter(kommun == "Göteborg")
+```
+
+### Visa de första raderna i den bearbetade dataramen.
+```{r}
+head(regso_data)
+```
+
+### Välj relevanta kolumner och döp om 'X2023' till 'antal'.
+```{r}
+(regso_data_processed=regso_data %>% dplyr::select(regso,kön,ålder,antal=X2023))
+```
+
+### Kombinera geometridata med SCB-data.
+```{r}
+(goteborg_regso_combined=goteborg_regso %>% left_join(regso_data_processed,by="regso"))
+```
+
+### Plot.
+```{r}
+tmap_mode("plot")
+```
+
+### Skapa en tematisk karta för Göteborg med antal per område.
+```{r}
+tm_shape(goteborg_regso_combined) +
+  tm_fill("antal",textNA="Saknas") +
+  tm_layout(legend.format=list(big.mark=" ",digits=0)) +
+  tm_borders() # + tm_facets("kön")
+```
+
+### tm_facets används här för att skapa separata kartor för varje unikt värde i kolumnen 'kön'
+### Detta gör att vi kan visa och jämföra geografiska mönster för olika kön sida vid sida.
+### Varje unikt värde i 'kön' (t.ex. 'man' och 'kvinna') resulterar i en egen tematisk karta.
+### Detta är användbart för att direkt visualisera/analysera hur geografiska data varierar beroende på kön över de geografiska områdena.
+
+
+
+
+## Raster
+### Image Segmentation with "supercells" package (https://github.com/Nowosad/supercells)
+### Data source: https://opengeodata.goteborg.se/files/ortofoto/2021/ortofoto_2021.html
+
+### Superpixels is a collection of segmentation concepts of grouping pixels with similar characteristics. It is often used in computer vision to
+### delineate parts of RGB images that are more meaningful to analyze. When applied to RGB images, each superpixel contains similar colors
+### that represent real-world objects. Tha packages uses modified version of the SLIC (simple Linear Iterative Clustering) algorithm  to extract supercells.
+### More info on SLIC can be found here: https://www.sciencedirect.com/science/article/pii/S1569843222001327?via%3Dihub
+
+### The ouput of image segmentation can later serve as an input to deep learning pipelines.
+
+### Load packages.
+```{r,warning=FALSE,message=FALSE}
+library(supercells) # superpixels for spatial data
+library(terra)      # spatial raster data processing
+library(sf)         # spatial vector data processing
+```
+
+### Import orthophoto in .tif format.
+```{r}
+(ortho=rast("./Raster/6398_148_2021.tif"))
+```
+
+### Plot orthophoto.
+```{r}
+plot(ortho)
+```
+
+### Create buffer around Clarion Hotel Post and plot it.
+```{r}
+# Clarion Hotel Post GPS coordinates
+point_GPS=data.frame(lon=11.974692286507148,lat=57.707960263899295)
+
+# Convert the data frame to an sf (spatial data frame) object with EPSG:4326 (WGS84)
+point_sf=st_as_sf(point_GPS,coords=c("lon","lat"),crs=4326)
+
+# Re-project to EPSG:3007
+point_sf=st_transform(point_sf,crs=3007)
+
+# Create a square buffer around hotel with a 150 m distance 
+buffer=st_buffer(point_sf,dist=50,endCapStyle="SQUARE")
+
+# Plot the buffer on the top of orthophoto
+plot(ortho)
+plot(buffer,add=TRUE)
+```
+
+### Clip orthophoto to the buffer and plot it.
+```{r}
+# Clip to buffer
+(ortho=crop(ortho,buffer,mask=T))
+plot(ortho)
+```
+
+### Image segmentation.
+```{r}
+(ortho_segm=supercells(ortho,k=2000,compactness=10,transform="to_LAB"))
+```
+
+### Plot results on top of orthophoto.
+```{r}
+plot(ortho)
+plot(st_geometry(ortho_segm),add=TRUE)
+```
+
+### Function to convert results to hexadecimal representation.
+```{r}
+rgb_to_hex=function(x){apply(t(x),2,function(x) rgb(x[1], x[2], x[3],maxColorValue=255))}
+```
+
+```{r}
+avg_colors=rgb_to_hex(st_drop_geometry(ortho_segm[4:6]))
+print(head(avg_colors,100))
+```
+
+### Plot each superpixel with its average color, but without the border lines.
+```{r}
+plot(st_geometry(ortho_segm),border=NA,col=avg_colors)
+```
+
+### Note that the above visualization is not an image - it is a set of colored superpixels. So, instead of representing this area by 160000 cells
+### in .tif files, we are using 1880 superpixels. This "ortho_segm" object can be next used for clustering similar objects or labeling them for DL.
+
+### Save "ortho_segm" as geojson.
+```{r}
+st_write(ortho_segm,"./Raster/ortho_segm.geojson")
+```
+
+### Let's import the .geojson file just to check if it works.
+```{r}
+(segm=st_read("./Raster/ortho_segm.geojson"))
+```
+
+### Plot.
+```{r}
+plot(segm)
+```
+
+### Yahoo, now we have done our raster processing!
+
+
+
+
+## LiDAR processing with "lidR" package (https://r-lidar.github.io/lidRbook/index.html)
+### Data source: https://www.lantmateriet.se/en/geodata/geodata-products/product-list/laser-data-download-nh
+
+### lidR is a package for airborne LiDAR Ddata manipulation and visualization for forestry applications.
+### It provides functions to read and write .las and .laz files, plot point clouds, compute metrics using an area-based approach,
+### compute digital canopy models, thin LiDAR data, manage a collection of las/laz files, process a collection of tiles using multicore processing, 
+### segment individual trees, classify points from geographic data, and many many more. It is really a lot of fun!
+
+### Load packages.
+```{r,warning=FALSE,message=FALSE}
+library(lidR)      # lidR for point cloud data processing
+library(rayshader) # visualizations
+library(raster)    # spatial raster data processing
+library(gstat)     # spatial statistics
+```
+
+### Import .laz file (only x, y, z and c attributes).
+```{r}
+(las=readLAS("./LiDAR/23F053_703_40_2500.laz",select="xyzc"))
+# plot(las,size=3,bg="black") # 3d rendering on R client
+```
+
+### Structure of the las file.
+```{r}
+str(las)
+# plot(las,bg="black",size=3) # 3d rendering on R client
+```
+
+### Create DTM with triangular irregular network (using Delaunay triangulation).
+```{r}
+(dtm_tin=rasterize_terrain(las,res=1,algorithm=tin()))
+# plot_dtm3d(dtm_tin,bg="white") # 3d rendering on R client
+```
+
+### Rasterize DTM for visualization.
+```{r}
+(dtm=raster::raster(dtm_tin)) # create raster from DTM
+```
+
+### Raster to matrix conversion.
+```{r}
+elmat=raster_to_matrix(dtm_tin) # turns raster into a matrix suitable for Rayshader
+```
+
+### Plot with Rayshader in 2D.
+```{r}
+map=elmat %>%
+  sphere_shade(texture="imhof1",progbar=FALSE) |>
+  add_water(detect_water(elmat),color="imhof1") |>
+  add_shadow(ray_shade(elmat,progbar=FALSE),0.5) |>
+  add_shadow(ambient_shade(elmat,progbar=FALSE),0)
+plot_map(map)
+```
+
+### Compute slope and aspect.
+```{r}
+(dtm_prod=terrain(dtm_tin,v=c("slope","aspect"),unit="radians"))
+```
+
+### Plot results.
+```{r}
+plot(dtm_prod)
+```
+
+### Compute hillshade.
+```{r}
+(dtm_hillshade=shade(slope=dtm_prod$slope,aspect=dtm_prod$aspect))
+```
+
+### Plot hillshade.
+```{r}
+plot(dtm_hillshade,col=gray(0:30/30),legend=FALSE)
+```
+
+### Make raster list.
+```{r}
+(raster_list=list(dtm_tin,dtm_prod,dtm_hillshade))
+```
+
+### Export all results as .tif files.
+```{r}
+file_names=c("dtm_tin.tif","dtm_prod.tif","dtm_hillshade.tif")
+for (i in seq_along(raster_list)) {
+  output_path="./LiDAR/"
+  writeRaster(raster_list[[i]],filename=paste0(output_path,file_names[i]),overwrite=TRUE)
+}
+```
+
+### Import the .tif file just to check if it works.
+```{r}
+# Import .tif file
+(dtm_hillshade=rast("./LiDAR/dtm_hillshade.tif"))
+```
+
+### Plot.
+```{r}
+plot(dtm_hillshade)
+```
+
+### Yahoo, now we have done our point cloud processing!
+
+
+
+# Advanced geospatial data processing with R
+## Java script
+### Interaktiv kartvisualisering med R och tmap.
+### Detta skript visar hur man kan omvandla en statisk karta till en interaktiv JavaScript-karta i R med hjälp av tmap-paketet.
+### Användningen av JavaScript är viktig för att möjliggöra dynamisk och användarinteraktiv visualisering, där användarna kan zooma,
+### panorera och utforska datan på ett mer engagerande sätt.
+
+### Interaktiva kartor är särskilt användbara för att presentera och utforska geografiska data och statistik, då de tillåter användaren
+### att interagera direkt med kartelementen och få detaljerad information om specifika områden.
+
+### Klassindelning med 'fisher' refererar till Fishers optimala klassindelningsmetod, som används för att dela in kontinuerliga data
+### i klasser på ett sätt som minimerar intern varians inom varje klass och maximerar variansen mellan klasserna.
+### Denna metod kan ge en mer statistiskt motiverad indelning av data, vilket kan hjälpa till att framhäva signifikanta mönster i datan.
+
+### Fördelar med 'fisher' klassindelningen:
+### - Ger en objektiv, datastyrd indelning som kan avslöja dolda mönster.
+### - Minimerar risken för subjektiva bias i valet av klassgränser.
+
+### Nackdelar med 'fisher' klassindelningen:
+### - Kan vara känslig för outliers och extremvärden.
+### - Kräver ofta mer data för att skapa meningsfulla och statistiskt robusta klasser.
+
+### Ladda nödvändiga paket.
+```{r,warning=FALSE,message=FALSE}
+library(sf)
+library(dplyr)
+library(jsonlite)
+library(stringr)
+library(stringdist)
+library(tmap)
+```
+
+### Läs in geometridata för registreringsområden (RegSO) från GeoPackage.
+```{r}
+(regso=st_read("Vector/RegSO_2018_v2.gpkg"))
+```
+
+### Filtrera ut data för Göteborgs kommun.
+```{r}
+(goteborg_regso=regso %>% filter(kommunnamn == "Göteborg"))
+```
+
+### Visa den geometriska plotten för Göteborgs kommun.
+```{r}
+plot(st_geometry(goteborg_regso))
+```
+
+### Läs in SCB-data från CSV-fil och filtrera bort totalvärden.
+```{r}
+(regso_data=read.csv("Vector/000005FF.csv",fileEncoding="ISO8859-1",sep=";") %>%
+  filter(kön != "totalt"))
+```
+
+### Bearbeta data för att extrahera 'kommun' och 'regso' och justera textsträngar.
+```{r}
+regso_data=regso_data %>%
+  mutate(
+    kommun=str_trim(str_extract(region, "^[^(]+")),
+    regso=str_replace_all(str_extract(region, "\\((.*?)\\)"), "\\(|\\)", "")
+  ) %>%
+  filter(kommun == "Göteborg")
+```
+
+### Visa de första raderna i den bearbetade dataramen.
+```{r}
+head(regso_data)
+```
+
+### Välj relevanta kolumner och döp om 'X2023' till 'antal'.
+```{r}
+(regso_data_processed=regso_data %>% dplyr::select(regso,kön,ålder,antal=X2023))
+```
+
+### Kombinera geometridata med SCB-data.
+```{r}
+(goteborg_regso_combined=goteborg_regso %>% left_join(regso_data_processed,by="regso"))
+```
+
+### Skapa en tematisk karta för Göteborg med antal per område.
+```{r}
+t=tm_shape(goteborg_regso_combined) +
+  tm_fill("antal",textNA="Saknas",alpha=0.3,style="fisher") +
+  tm_layout(legend.format=list(big.mark=" ",digits=0)) +
+  tm_borders()
+```
+
+```{r}
+tmap_mode("view")
+```
+
+```{r}
+t
+```
+
+
+
+
+## Google API >> in a separate project "GEE_demo" run locally on Sveta's machine
+
+
+
+
+## Open Street Maps
+### Visualisering av befolkningsdata och tunnelbanestationer i Stockholm
+
+### Detta skript syftar till att visualisera befolkningsdata för specifika områden i Stockholm och integrera denna
+### information med geografiska positioner för tunnelbanestationer och linjer.
+### Befolkningsdata aggregeras på DeSO-nivå (demografiska statistikområden) och kombineras med spatial data för att
+### framställa en interaktiv karta som visar befolkningstäthet och läget för tunnelbanesystemet.
+
+### Datakällor:
+### - Befolkningsdata hämtas från Statistiska centralbyrån (SCB).
+### - Geometriska data för DeSO-områden och tunnelbanestationer hämtas från OpenStreetMap och geopackage-filer.
+
+### Huvudsakliga steg i processen:
+### 1. Inläsning och förberedelse av befolkningsdata och geodata.
+### 2. Transformation och skalning av befolkningsdata för att förbättra visualiseringen.
+### 3. Hämtning/bearbetning av spatial data för tunnelbanestationer och linjer från OpenStreetMap.
+### 4. Filtrering/bearbetning av tunnelbanestationer baserat på specifika linjer (grön, röd, blå).
+### 5. Skapande av buffer-zoner runt stationerna för att representera dem geografiskt på kartan.
+### 6. Sammanslagning och interpolering av befolkningsdata och geodata för att skapa en integrerad kartbild.
+### 7. Användning av tmap-paketet i R för att skapa och visa en tematisk karta som kombinerar all data.
+
+### Befolkningsdata normaliseras och skalas logaritmiskt för att skapa en jämn och tydlig visualisering.
+
+### Resultatet är en karta som inte bara visar befolkningsfördelning i Stockholm utan också integrerar detta med
+### tunnelbanestationernas och linjernas läge för att ge en helhetsbild av både befolkningstäthet och transportinfrastruktur.
+
+### Ladda nödvändiga paket.
+```{r,warning=FALSE,message=FALSE}
+library(dplyr)
+library(osmdata)  # För att hämta data från OpenStreetMap
+library(sf)       # För att hantera spatial data
+library(tmap)     # För att skapa och konfigurera den slutgiltiga kartan
+library(areal)
+```
+
+### Läs in befolkningstäthet data.
+```{r}
+(pop_deso=read.csv("https://www.statistikdatabasen.scb.se/sq/147782",sep=",",fileEncoding="ISO8859-1") %>% 
+  rename(antal=X2023) %>% 
+  filter(substr(region,1,4) %in% c("0180","0127","0184","0183","0162")) %>% 
+  rename(desokod=region))
+```
+
+```{r}
+(deso=st_read("Vector/DeSO_2018.gpkg") %>% 
+  filter(substr(deso,1,4) %in% c("0180","0127","0184","0183","0162")) %>% 
+  st_transform(.,crs=3011) %>% 
+  rename(desokod=deso))
+```
+
+### Join by "desokod".
+```{r}
+(deso=left_join(deso,pop_deso,by="desokod"))
+```
+
+### Lägg till en kolumn för logaritmisk skalning.
+```{r}
+deso$log_antal=log(deso$antal+1)     # För att undvika log(0)
+deso$exp_antal=(deso$log_antal)^1.5  # Exponentiell justering
+```
+
+### Normalisera 'antal' genom att dela varje värde med maxvärdet.
+```{r}
+deso$normalized_antal=deso$antal / max(deso$antal)
+```
+
+### För att öka skillnaderna i storlek på symbolerna kan vi multiplicera de normaliserade värdena med en faktor, till exempel 100 om det behövs.
+```{r}
+deso$scaled_antal=deso$normalized_antal * 100
+```
+
+### Hämta bounding box-koordinater för Stockholms kommun i WGS84.
+```{r}
+(stockholm_bbox_polygon=getbb("Stockholm, Sweden",format_out="sf_polygon") %>% st_set_crs(4326))  # Ange koordinatsystemet till WGS84
+```
+
+### Omvandla bounding box till en spatial bounding box (bbox) objekt.
+```{r}
+(stockholm_bbox=st_bbox(stockholm_bbox_polygon))
+```
+
+### Hämta tunnelbanestationer (punkter).
+```{r}
+(subway_stations_query=opq(bbox=stockholm_bbox) %>%
+  add_osm_feature(key='station',value='subway') %>%
+  osmdata_sf())
+```
+
+### Hämta tunnelbanelinjer (linjer).
+```{r}
+(subway_lines_query=opq(bbox=stockholm_bbox) %>%
+  add_osm_feature(key='railway',value='subway') %>%
+  osmdata_sf())
+```
+
+### Query linjegeometrier.
+```{r}
+(subway_lines=subway_lines_query$osm_lines)
+```
+
+### Transformera Stockholm polygon till det lokala koordinatsystemet (SWEREF99 TM).
+```{r}
+(stockholm_polygon_projected=st_transform(stockholm_bbox_polygon,3011))
+```
+
+### Query tunnelbanestationer.
+```{r}
+subway_stations=subway_stations_query$osm_points
+subway_stations$name_lower <- tolower(subway_stations$name)
+
+# Använd mjuk matchning för att filtrera stationer
+match_with_tolerance <- function(target_list, station_list, max_distance = 1) {
+  sapply(target_list, function(target) {
+    matches <- amatch(target, station_list, maxDist = max_distance)
+    if (is.na(matches)) {
+      NA
+    } else {
+      station_list[matches]
+    }
+  })
+}
+```
+
+### Lägg till namn för den gröna linjen.
+```{r}
+grona_linjen <- unique(tolower(c("Hässelby Strand", "Johannelund", "Vällingby", "Råcksta", "Blackeberg", "Islandstorget", "Ängbyplan", "Åkeshov", 
+                  "Brommaplan", "Abrahamsberg", "Stora Mossen", "Alvik", "Kristineberg", "Thorildsplan", "Fridhemsplan", "Slussen", 
+                  "Medborgarplatsen", "Skanstull", "Globen", "Enskede Gård", "Sockenplan", "Svedmyra", "Stureby", "Bandhagen", 
+                  "Högdalen", "Rågsved", "Hagsätra", "Odenplan", "Rådmansgatan", "St Eriksplan", "Hötorget", "Västertorp", 
+                  "Farsta", "Farsta Strand", "Skogskyrkogården", "Skärmarbrink", "Blåsut", "Bagarmossen", "Kärrtorp", "Gullmarsplan")))
+
+```
+
+### Lägg till namn för den röda linjen.
+```{r}
+roda_linjen <- unique(tolower(c("Ropsten", "Gärdet", "Karlaplan", "Östermalmstorg", "T-Centralen", "Gamla Stan", "Slussen", "Mariatorget", 
+                 "Zinkensdamm", "Hornstull", "Liljeholmen", "Aspudden", "Örnsberg", "Midsommarkransen", "Telefonplan", 
+                 "Hägerstensåsen", "Västertorp", "Fruängen", "Bredäng", "Sätra", "Skärholmen", "Vårberg", "Vårby gård", 
+                 "Fittja", "Alby", "Hallunda", "Norsborg", "Mälarhöjden", "Bäckehagen", "Stadion", "Universitetet", "Tekniska högskolan")))
+
+```
+
+### Lägg till namn för den blåa linjen.
+```{r}
+bla_linjen <- unique(tolower(c("Kungsträdgården", "T-Centralen", "Rådhuset", "Fridhemsplan", "Västra Skogen", "Solna Centrum", "Näckrosen", 
+                "Hallonbergen", "Rinkeby", "Tensta", "Hjulsta", "Rissne", "Duvbo", "Sundbybergs Centrum", "Solna Strand", 
+                "Stadshagen", "Alby", "Husby", "Akalla", "Kista")))
+```
+
+### Filtrera.
+```{r}
+#alla_linjer <- c("T-Centralen")
+
+matched_grona <- match_with_tolerance(grona_linjen, subway_stations$name_lower)
+matched_roda <- match_with_tolerance(roda_linjen, subway_stations$name_lower)
+matched_bla <- match_with_tolerance(bla_linjen, subway_stations$name_lower)
+
+subway_stations_gron <- subway_stations %>% filter(name_lower %in% matched_grona)
+subway_stations_roda <- subway_stations %>% filter(name_lower %in% matched_roda)
+subway_stations_bla <- subway_stations %>% filter(name_lower %in% matched_bla)
+```
+
+### Create buffer.
+```{r}
+# create buffer
+buffer_gron <- st_buffer(subway_stations_gron, 500) %>% 
+  dplyr::select(name, osm_id) %>% 
+  st_transform(., crs = 3011)
+
+buffer_rod <- st_buffer(subway_stations_roda, 500) %>% 
+  dplyr::select(name, osm_id) %>% 
+  st_transform(., crs = 3011)
+
+buffer_bla <- st_buffer(subway_stations_bla, 500) %>% 
+  dplyr::select(name, osm_id) %>% 
+  st_transform(., crs = 3011)
+```
+
+### Interpolera för den gröna linjen.
+```{r}
+x <- aw_interpolate(buffer_gron, tid = osm_id, source = deso, sid = desokod, 
+                    weight = "sum", output = "tibble", extensive = "antal")
+
+buffer_gron <- left_join(buffer_gron, x)
+```
+
+### Interpolera för den blåa linjen.
+```{r}
+x <- aw_interpolate(buffer_bla, tid = osm_id, source = deso, sid = desokod, 
+                    weight = "sum", output = "tibble", extensive = "antal")
+buffer_bla <- left_join(buffer_bla, x)
+```
+
+### Interpolera för den röda linjen.
+```{r}
+x <- aw_interpolate(buffer_rod, tid = osm_id, source = deso, sid = desokod, 
+                    weight = "sum", output = "tibble", extensive = "antal")
+
+buffer_rod <- left_join(buffer_rod, x)
+```
+
+### Plot.
+```{r}
+t <- tm_shape(stockholm_polygon_projected) + tm_polygons(alpha = 0, border.col = "black") +
+  tm_shape(buffer_bla) + 
+  tm_dots(col = "antal", style = "jenks", palette = "Blues", border.col = "black", size = "antal") +
+  
+  tm_shape(buffer_gron) + 
+  tm_dots(col = "antal", style = "jenks", palette = "Greens", border.col = "black", size = "antal") +
+  
+  tm_shape(buffer_rod) + 
+  tm_dots(col = "antal", style = "jenks", palette = "Reds", border.col = "black", size = "antal") +
+  # tm_view(alpha = 1, basemaps = "Stamen.TonerLines") +
+  tm_layout(legend.show = F, frame = F) +
+  tm_shape(subway_lines) + tm_lines(lwd = 2)
+```
+
+```{r}
+t
+```
+
+
+
+
+### Detta R-skript används för att hämta data från LFVs 'Drönarkartan' via Luftfartsverkets öppna WFS-tjänst.
+### 'Drönarkartan' tillhandahåller information som är viktig för fjärrpiloter av drönare (UAS, UAV, RPAS) 
+### för att identifiera var de kan flyga säkert utan att störa den ordinarie flygtrafiken.
+### Kartan reflekterar AIP-data och relevanta AIP-tillägg (AIP SUP) samt inkluderar information 
+### om flygplatser, luftrum (CTR, TIZ, ATZ), permanenta restriktionsområden och farliga områden.
+### Observera att temporära restriktionsområden och NOTAM-meddelanden måste kontrolleras separat 
+### eftersom de inte inkluderas i denna datakälla.
+### Skriptet utför ett WFS-anrop för att hämta restriktionsområden (RSTA) där höjdgränsen är marknivå ('GND') 
+### och omvandlar svaret till ett spatialt 'sf'-objekt i R.
+```{r,warning=FALSE,message=FALSE}
+library(sf)
+library(httr)
+```
+
+### URL till WFS-tjänsten.
+```{r}
+base_url="https://daim.lfv.se/geoserver/wfs"
+```
+
+### Parametrar för WFS-anrop.
+```{r}
+params=list(
+  service="WFS",
+  version="1.1.0",
+  request="GetFeature",
+  typename="mais:RSTA",
+  CQL_FILTER="LOWER='GND'",
+  outputFormat="application/json",
+  srsname="EPSG:3857"
+)
+```
+
+### Skicka GET-förfrågan till WFS-tjänsten och läs svaret som GeoJSON.
+```{r}
+response <- httr::GET(url=base_url,query=params)
+geojson_data <- httr::content(response,"text",encoding="UTF-8")
+```
+
+### Konvertera svaret till en sf-objekt. Notera: om du vill omprojicera till WGS84 (EPSG:4326), kan du använda st_transform.
+```{r,warning=FALSE,message=FALSE,print=FALSE,include=FALSE}
+features <- st_read(geojson_data)
+features_wgs84 <- st_transform(features,4326)
+```
+
+### Visa resultatet (kartan).
+```{r}
+mapview::mapview(features_wgs84)
+```
+
+
+
+
+## 3D visualisation with Rayshader
+### Skriptet demonstrerar hur man kan använda en kombination av öppna datakällor och data science-verktyg
+### för att skapa en digital tvilling, en virtuell representation av ett fysiskt område eller objekt.
+### Genom att bearbeta och integrera geospatial data från flera källor, såsom LiDAR-punktmoln, OpenStreetMap
+### och geografiska informationslager, skapas en detaljerad och interaktiv modell av ett geografiskt område.
+
+### Processflödet omfattar:
+### 1. Insamling/inläsning av geospatial data (LiDAR) för att generera detaljerade terrängmodeller.
+### 2. Identifiering och extraktion av specifika geoobjekt (som träd) från punktmolndata.
+### 3. Aggregering och rumsanalys av insamlade data för att bygga en sammanhängande geospatial modell.
+### 4. Användning av OpenStreetMap-data för att berika modellen med ytterligare geografiska element
+### som vägar, vilket är viktigt för att skapa en mer fullständig bild av det studerade området.
+### 5. Visualisering och analys genom avancerade kartläggningstekniker och 3D-rendering för att
+### visualisera den digitala tvillingen, vilket möjliggör interaktiv utforskning och analys.
+
+### Genom att följa dessa steg, visar skriptet hur man kan programmatiskt konstruera en digital tvilling
+### med öppen och tillgänglig teknologi, vilket lägger en grund för vidare anpassning och utveckling i
+### syfte att möta specifika forsknings-, planerings- och beslutsbehov.
+
+### Ladda de nödvändiga biblioteken för att hantera geospatial data, rasterdata, och att skapa visuella representationer.
+```{r,warning=FALSE,message=FALSE}
+library(dplyr)
+library(lidR)      # Används för att hantera LAZ-filer (LiDAR-data)
+library(sf)        # Används för att hantera geospatiala vektor-data
+library(raster)    # Används för att hantera rasterdata
+library(osmdata)   # Används för att hämta data från OpenStreetMap
+library(rayshader) # Används för att skapa 3D-visualiseringar av rasterdata
+library(magick)
+```
+
+### Definiera sökvägen där LAS-filerna lagras och läs in filnamnen.
+```{r eval=FALSE,include=FALSE}
+lasFolderPath <- "LiDAR/laz"
+lasFiles <- list.files(lasFolderPath,full.names=TRUE)
+```
+
+### Initalisera listor för att lagra de processade terrängmodellerna och trädlokaliseringarna.
+```{r eval=FALSE,include=FALSE}
+terrainModels <- list()
+treeLocations <- list()
+```
+
+## Iterera över varje LAS-fil, läs in, bearbeta och extrahera relevant information.
+```{r eval=FALSE,include=FALSE}
+for (i in seq_along(lasFiles)) {
+   lasData <- readLAS(lasFiles[i])  # Läs in LAS-data
+   terrainModel <- grid_terrain(lasData,algorithm=tin())  # Skapa terrängmodell
+   
+   terrainModels[[i]] <- terrainModel
+   print(paste("Processing file:",i))
+   
+   # Tunnar ut LAS-punkter och lokaliserar träd
+   thinnedLasData <- decimate_points(lasData,homogenize(0.5,5))
+   trees <- locate_trees(thinnedLasData,lmf(ws=8))
+   st_crs(trees) <- 3006  # Sätt koordinatsystemet
+   treeLocations[[i]] <- trees
+ }
+```
+
+### Spara trädlokaliseringar och kombinera dem till en data.frame.
+```{r eval=FALSE,include=FALSE}
+treeDataFrame <- do.call(rbind,treeLocations)
+```
+
+### Extrahera koordinaterna för träd med höjd mindre än 45 meter från den sista filens bearbetade data.
+```{r eval=FALSE,include=FALSE}
+lastTreeData <- treeLocations[[length(treeLocations)]]
+treeCoordinates <- st_coordinates(lastTreeData %>% filter(Z < 45))
+```
+
+### Förbered argument för att skapa en mosaik av terrängmodellerna.
+```{r eval=FALSE,include=FALSE}
+#terrainModels$fun <- mean
+#terrainModels$na.rm <- TRUE
+#terrainMosaic <- do.call(mosaic, terrainModels)
+#crs(terrainMosaic) <- 3006  # Sätt koordinatsystemet för mosaiken
+terrainMosaic <- raster("LiDAR/dtm_järva_25m.tif")
+```
+
+### Läs in och processa shape-filen för Järva, ett geografiskt område.
+```{r eval=FALSE,include=FALSE}
+jarvaRegion <- st_read("Vector/Stadsdelsnämnder.gpkg") %>% 
+   filter(Namn %in% c("Järva")) %>% 
+   st_zm(drop=TRUE) %>% 
+   st_transform(crs=st_crs(terrainMosaic))
+```
+
+### Beskär och maskera terrängmosaiken med Järva-regionen.
+```{r eval=FALSE,include=FALSE}
+jarvaTerrainModel <- crop(terrainMosaic,jarvaRegion)
+jarvaTerrainModel <- mask(jarvaTerrainModel,jarvaRegion)
+# writeRaster(jarvaTerrainModel,"LiDAR/dtm_järva.tif")
+```
+
+### Skapa en bounding box för att hämta OpenStreetMap-data för Järva-regionen.
+```{r eval=FALSE,include=FALSE}
+jarvaRegion <- st_transform(jarvaRegion,crs=4326)
+bb <- st_bbox(jarvaRegion)
+```
+
+### Hämta och processa vägdata från OpenStreetMap för den specificerade regionen.
+```{r eval=FALSE,include=FALSE}
+small_streets <- opq(bbox=bb) %>%
+  add_osm_feature(key="highway",value=c("secondary","tertiary","secondary_link","tertiary_link")) %>%
+  osmdata_sf()
+
+small_streets <- small_streets$osm_lines %>% st_transform(.,crs=st_crs(jarvaTerrainModel))
+# st_write(small_streets,"Vector/small_streets.gpkg",delete_dsn=TRUE)
+```
+
+### Förbered och skriv ut terrängmodellen med höjd- och texturöverskuggningar, inklusive vägdata. Börja med att sampla om data, av prestandaskäl. För visualiseringen räcker 25 m-upplösning.
+```{r eval=FALSE,include=FALSE}
+jarvaTerrainModel_25m <- raster::aggregate(jarvaTerrainModel,25)
+#writeRaster(jarvaTerrainModel_25m,"LIDAR/dtm_järva_25m.tif")
+```
+
+### Läs in väg-/gatunätet för visualisering.
+```{r}
+small_streets <- st_read("Vector/small_streets.gpkg")
+```
+
+### Läs in den omsamplade terrängmodellen.
+```{r}
+jarvaTerrainModel_25m <- raster::raster("LiDAR/dtm_järva_25m.tif")
+```
+
+### Konvertera den aggregerade terrängmodellen till en matris för hantering av Rayshader.
+```{r}
+elmat=rayshader::raster_to_matrix(jarvaTerrainModel_25m)
+```
+
+### Skapa en 3D-visualisering med skuggor, texturer och linjeöverlägg för vägar.
+```{r}
+elmat %>%
+  height_shade() %>%
+  add_overlay(sphere_shade(elmat,texture="desert",colorintensity=5),alphalayer=0.5) %>%
+  add_shadow(lamb_shade(elmat),0) %>%
+  add_shadow(ambient_shade(elmat),0) %>%
+  add_shadow(texture_shade(elmat,detail=8/10,contrast=9,brightness=11),0.1) %>%
+  add_overlay(generate_line_overlay(small_streets,extent=raster::extent(jarvaTerrainModel_25m),
+                                    linewidth=1,color="white",heightmap=elmat)) %>%
+  plot_map()
+```
+
+
+
+
+# Tillägg: tree segmentation R+FME on Sveta's machine
+
+
+
+
+# Feedback
+## Menti: https://www.menti.com/ald4ngjoxpov
+## or kindly send your ideas/thoughts/feedback to svetlana.serikova@norconsult.com & anders.elias@stockholm.se
